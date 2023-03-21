@@ -156,15 +156,15 @@ def descriminator_part(descriminator, generator, real, z_size, \
     device = label.device
     #descriminator true part
     real.requires_grad_(True)
-    descr_real = descriminator(real)
+    descr_real = descriminator(real, label)
     #descriminator fake part
     with torch.no_grad():
         z = torch.randn(real.shape[0], z_size)
-        #z[z>2] = 2 #tales trancetion
         z = z.to(device)
-        fake = generator(z, label)
+        fake_label = torch.randint_like(label,2)
+        fake = generator(z, fake_label)
     fake.requires_grad_(True)
-    descr_fake = descriminator(fake)
+    descr_fake = descriminator(fake, fake_label)
     loss = discriminator_logistic_non_saturating(descr_fake, descr_real)
     gradient_penalty = zero_centered_gradient_loss(descr_real, descr_fake, real, fake)
     desc_loss_list.append(loss.item())
@@ -173,9 +173,9 @@ def descriminator_part(descriminator, generator, real, z_size, \
     return loss
 
 #for human genome frequences are
-#A=0.235 C=0.172 T=0.415 G=0.178
+#'A':0.2733 'C':0.2296 'T':0.2284 'G':0.2685
 def mini_batch_descrimination(batch, temp=15.0, \
-    weights=[0.235, 0.172, 0.415, 0.178]):
+    weights=[0.2733, 0.2296, 0.2284, 0.2685]):
     weights = 1 / torch.FloatTensor(weights)
     weights = weights / torch.sum(weights)
     weights = weights.to(batch.device)
@@ -190,13 +190,13 @@ def mini_batch_descrimination(batch, temp=15.0, \
             with torch.no_grad():
                 dna1 = torch.argmax(vector1, dim=0)
                 mol_weights1 = weights[dna1]
-                max_weights1 = vector1.max(dim=0)[0]
+                max_weights1 = torch.sqrt(vector1.max(dim=0)[0])
                 mol_weights1 = mol_weights1 / max_weights1
             vector2 = batch[j,:,:]
             with torch.no_grad():
                 dna2 = torch.argmax(vector2, dim=0)
                 mol_weights2 = weights[dna2]
-                max_weights2 = vector2.max(dim=0)[0]
+                max_weights2 = torch.sqrt(vector2.max(dim=0)[0])
                 mol_weights2 = mol_weights2 / max_weights2
             vector2_norm = torch.norm(vector2, dim=0)
             vector2_norm = vector2_norm[None,:].repeat(batch.shape[1],1)
@@ -210,20 +210,34 @@ def mini_batch_descrimination(batch, temp=15.0, \
     return loss
 
 
+def frequence_loss(batch, frequences=[0.2733, 0.2296, 0.2284, 0.2685]):
+    frequences_estim = batch.mean(dim=0)
+    frequences_estim = frequences_estim.mean(dim=1)
+    loss_f = torch.nn.MSELoss()
+    with torch.no_grad():
+        frequences = torch.FloatTensor(frequences).to(batch.device)
+    loss = 10*loss_f(frequences_estim, frequences)
+    return loss 
+
+
 def generator_part(descriminator, generator, input, \
-                  z_size, gen_loss_list, batch_diver_list, label):
-    device = label.device
+                  z_size, gen_loss_list, batch_diver_list, \
+                  frequency_loss_list, label):
     #generator part
+    device = label.device
     z = torch.randn(input.shape[0], z_size)
-    #z[z>2] = 2 #tales trancetion
     z = z.to(device)
-    fake = generator(z, label)
-    generator_fake = descriminator(fake)
+    fake_label = torch.randint_like(label,2)
+    fake = generator(z, fake_label)
+    generator_fake = descriminator(fake, fake_label)
     loss = generator_logistic_non_saturating(generator_fake)
     batch_diversity = mini_batch_descrimination(fake)
+    freq_loss = frequence_loss(fake)
     batch_diver_list.append(batch_diversity.item())
     gen_loss_list.append(loss.item())
-    return  batch_diversity + loss
+    frequency_loss_list.append(freq_loss.item())
+
+    return  loss #+batch_diversity
 
 
 def generator_part_wasser(descriminator, generator, input, \
@@ -242,10 +256,10 @@ def generator_part_wasser(descriminator, generator, input, \
     return  loss
 
 
-
 def end_of_gan_epoch(generator, descriminator, input, z_size, label, path_to_save=None):
         z = torch.randn(input.shape[0], z_size)
         z = z.to(label.device)
+        generator.eval()
         fake = generator(z, label)
         fake = fake.detach().cpu()
         print(fake[0,:,99].tolist())
@@ -257,18 +271,21 @@ def end_of_gan_epoch(generator, descriminator, input, z_size, label, path_to_sav
             print(dna)
 
         mol_stats = generator_stats(generator, z_size, label, 1)
-        print("hh:  A=0.235 C=0.172 T=0.415 G=0.178")
+        print("mm kouz:  'A':0.2733 'C':0.2296 'T':0.2284 'G':0.2685")
         print("gen:", mol_stats)
         generator_4mers_dict = generator_stats(generator, z_size, label, 4)
-        with open("weights/hh_stat.json", "r") as outfile:
+        with open("weights/kouzine_mm_stat.json", "r") as outfile:
             hh_kmer_dict = json.load(outfile)
-    
+
+        generator.train()
+
         delta_p = [generator_4mers_dict[key] - hh_kmer_dict[key] for key in hh_kmer_dict]
         delta_p = np.abs(delta_p).sum() / 2
         print("4mers discrepency:", delta_p)
 
-        if path_to_save is not None:
-            path_to_save_g = os.path.join(path_to_save, "generator.pth")
-            torch.save(generator.state_dict(), path_to_save_g)
-            path_to_save_d = os.path.join(path_to_save, "descriminator.pth")
-            torch.save(descriminator.state_dict(), path_to_save_d)
+        if delta_p < 0.095:
+            if path_to_save is not None:
+                path_to_save_g = os.path.join(path_to_save, "generator.pth")
+                torch.save(generator.state_dict(), path_to_save_g)
+                path_to_save_d = os.path.join(path_to_save, "descriminator.pth")
+                torch.save(descriminator.state_dict(), path_to_save_d)

@@ -25,6 +25,7 @@ def generator_stats(generator, z_size, condition, k_mers=4, n_trials=1000):
     device = condition.device
     for i in range(n_trials):
         z = torch.randn(1, z_size).to(device)
+        condition = torch.randint(2, (1,)).to(device)
         fake = generator(z, condition).squeeze(0).transpose(1,0)
         dna_fake = onehot_to_str(fake.cpu().detach().numpy())
         false_dict = kmer_stat(dna_fake, kmers_false)

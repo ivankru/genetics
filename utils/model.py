@@ -148,7 +148,7 @@ class DNAdescriminator(nn.Module):
 
         self.embedding_size = 4
         self.seq_len = 512
-        self.embedding = nn.Embedding(4101, self.embedding_size)
+        self.cond_embedding = ConditionalEmbedding(128)
         self.layer_norm = nn.LayerNorm(self.seq_len)
         # Output size for each convolution
         self.out_size = 4
@@ -180,9 +180,7 @@ class DNAdescriminator(nn.Module):
         self.fc1 = nn.Linear(32*2, 64)
         self.fc2 = nn.Linear(64, 1)
 
-    def forward(self, x):
-      #x = self.embedding(x)
-      #x = torch.transpose(x, 1, 2) 
+    def forward(self, x, label):
       # Convolution layer 1 is applied
       x1 = self.conv_1(x)
       x1 = self.activation(x1)
@@ -205,6 +203,11 @@ class DNAdescriminator(nn.Module):
       x = self.down2(x)
       x = self.down3(x)
       x = self.down4(x)
+
+      cond_embedding = self.cond_embedding(label)
+      cond_embedding = cond_embedding.reshape(x.shape)
+      x = x + cond_embedding
+
       x = self.activation(x)
       x = self.conv_2_1(x)
       x = self.activation(x)
@@ -224,17 +227,33 @@ class DNAdescriminator(nn.Module):
 class ConditionalEmbedding(nn.Module):
     def __init__(self, dim):
         super(ConditionalEmbedding, self).__init__()
-        self.const = lambda cond: torch.FloatTensor([-0.5, 0.5]) if \
-                     cond else torch.FloatTensor([0.5,-0.5])
-        self.fc1 = nn.Linear(2, 16)
-        self.fc2 = nn.Linear(16, dim)
+        self.fc1 = nn.Linear(2, 32)
+        self.layer_norm1 = nn.LayerNorm(32)
+        self.fc2 = nn.Linear(32, dim)
+        self.layer_norm2 = nn.LayerNorm(dim)
 
+    def const(self, cond):
+        cond = cond.repeat(2, 1).transpose(1,0)
+        device = cond.device
+        cond = cond.int()
+        cond1 = torch.FloatTensor([-0.5, 0.5]).to(device)
+        cond1 = cond1[None,:].repeat(cond.shape[0],1)
+        cond0 = torch.FloatTensor([0.5,-0.5]).to(device)
+        cond0 = cond0[None,:].repeat(cond.shape[0],1)
+        const_tensor = torch.zeros_like(cond1).to(device)
+        nonzer = torch.nonzero(cond)
+        const_tensor[cond==0] = cond0[cond==0]
+        const_tensor[cond==1] = cond1[cond==1]
+        return const_tensor
+      
     def forward(self, cond):
         x = self.const(cond).to(cond.device)
         x = self.fc1(x)
+        x = self.layer_norm1(x)
         x = F.mish(x)
         x = self.fc2(x)
-        return x.unsqueeze(0)
+        #x = self.layer_norm2(x)
+        return x
 
 
 class PixelShuffle1D(torch.nn.Module):
@@ -305,9 +324,10 @@ class UpsamplingBlock(nn.Module):
 
 
 class DNAgenerator(nn.Module):
-    def __init__(self, z_dim, output_size = 512):
+    def __init__(self, z_dim, output_size=512, softmax=True):
         super(DNAgenerator, self).__init__()
-        intermediate_level_size = 256
+        self.softmax = True
+        intermediate_level_size = 1024
         self.dim_levels = [64, 128, 256, 512]
         self.channel_levels = [64, 32, 16, 8]
         self.output_channels = 4
@@ -340,5 +360,62 @@ class DNAgenerator(nn.Module):
         x = self.up2(x, t)
         x = self.up3(x, t)
         x = self.res_conv(x)
-        x = torch.softmax(x, dim=1)
+        if self.softmax:
+            x = torch.softmax(x, dim=1)
         return x
+
+
+class DNAgenerator2(nn.Module):
+    def __init__(self, n_latent):
+        super(DNAgenerator2, self).__init__()
+        self.activation = nn.LeakyReLU()
+        self.init_fc = nn.Sequential(
+                    nn.Linear(n_latent, 2048),
+                    nn.BatchNorm1d(2048),
+                    self.activation,
+                    nn.Linear(2048, 4*512),
+                    nn.BatchNorm1d(4*512),
+                    self.activation,
+                    )
+        self.cond_embedding = ConditionalEmbedding(2048)
+        self.conv_init = nn.Sequential(
+                         nn.Conv1d(32,32,3, padding="same"),
+                         self.activation,
+                         nn.Conv1d(32,32,3, padding="same"),
+                         nn.LayerNorm(64),
+                         self.activation
+                        )
+        self.pixel_shuffle1 = PixelShuffle1D(4)
+        self.conv_up1 = nn.Sequential(
+                         nn.Conv1d(8,32,5, padding="same"),
+                         self.activation,
+                         nn.Conv1d(32,8,5, padding="same"),
+                         nn.LayerNorm(256),
+                         self.activation
+                        )
+        self.pixel_shuffle2 = PixelShuffle1D(2)                
+        self.conv_up2 = nn.Sequential(
+                         nn.Conv1d(4,32,5, padding="same"),
+                         self.activation,
+                         nn.Conv1d(32,4,5, padding="same"),
+                         nn.LayerNorm(512),
+                         self.activation
+                        )
+        self.res_conv = nn.Sequential(nn.Conv1d(4,4,3,padding="same"),
+                                      self.activation,
+                                      nn.Conv1d(4,4,1, bias=False))
+    
+    def forward(self, x, label):
+        assert x.shape[0] == label.shape[0]
+        cond_embd = self.cond_embedding(label)
+        x = self.init_fc(x)
+        x = x + 0.1*cond_embd
+        x = torch.reshape(x, [-1, 32, 64])
+        x = self.conv_init(x) + x
+        x = self.pixel_shuffle1(x)
+        x = self.conv_up1(x) + x
+        x = self.pixel_shuffle2(x)
+        x = self.conv_up2(x) + x
+        x = self.res_conv(x)
+        x = torch.softmax(x, dim=1)
+        return x 
